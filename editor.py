@@ -68,8 +68,8 @@ class Editor:
 
     def draw_status_bar(self, max_y, max_x):
         mode_str = f"-- {self.mode.upper()} --"
-        status_str = f"{mode_str} {self.row+1},{self.col+1}"
-        display_status_str = status_str.ljust(max_x)
+        status_str = f"{self.row+1},{self.col+1}"
+        display_status_str = f"{mode_str} {status_str}".ljust(max_x)
         try:
             self.stdscr.addstr(max_y - 2, 0, display_status_str, curses.A_REVERSE)
         except curses.error:
@@ -136,31 +136,53 @@ class Editor:
             self.command_buffer = ""
 
     def handle_insert_mode_key(self, key):
-        current_line = list(self.lines[self.row])
+        current_line_str = self.lines[self.row]
 
         if key == curses.KEY_BACKSPACE or key == 127 or key == 8:
             if self.col > 0:
-                current_line.pop(self.col - 1)
+                self.lines[self.row] = current_line_str[:self.col-1] + current_line_str[self.col:]
                 self.col -= 1
             elif self.row > 0: # Backspace at beginning of line, join with previous
-                prev_line = self.lines[self.row - 1]
-                self.col = len(prev_line)
-                self.lines[self.row - 1] += "".join(current_line)
-                self.lines.pop(self.row)
+                prev_line = self.lines.pop(self.row)
                 self.row -= 1
+                self.col = len(self.lines[self.row])
+                self.lines[self.row] += prev_line
         elif key == curses.KEY_ENTER or key == 10:
-            new_line = "".join(current_line[self.col:])
-            self.lines[self.row] = "".join(current_line[:self.col])
-            self.lines.insert(self.row + 1, new_line)
-            self.row += 1
-            self.col = 0
+            # If cursor is at the end of the line, insert a new empty line
+            if self.col == len(self.lines[self.row]):
+                self.lines.insert(self.row + 1, "")
+                self.row += 1
+                self.col = 0
+            else:
+                # Split the current line at the cursor position
+                line_before_cursor = self.lines[self.row][:self.col]
+                line_after_cursor = self.lines[self.row][self.col:]
+                
+                # Update the current line to contain only the part before the cursor
+                self.lines[self.row] = line_before_cursor
+                
+                # Insert a new line below the current line with the part after the cursor
+                self.lines.insert(self.row + 1, line_after_cursor)
+                
+                # Move cursor to the beginning of the new line
+                self.row += 1
+                self.col = 0
         elif key == 27: # ESC key
             self.mode = 'normal'
+        elif key == curses.KEY_LEFT: # Handle left arrow key in insert mode
+            self.col = max(0, self.col - 1)
+        elif key == curses.KEY_RIGHT: # Handle right arrow key in insert mode
+            self.col = min(len(self.lines[self.row]), self.col + 1)
+        elif key == curses.KEY_UP: # Handle up arrow key in insert mode
+            self.row = max(0, self.row - 1)
+            self.col = min(len(self.lines[self.row]), self.col)
+        elif key == curses.KEY_DOWN: # Handle down arrow key in insert mode
+            self.row = min(len(self.lines) - 1, self.row + 1)
+            self.col = min(len(self.lines[self.row]), self.col)
         else:
             if 32 <= key <= 126:
-                current_line.insert(self.col, chr(key))
+                self.lines[self.row] = current_line_str[:self.col] + chr(key) + current_line_str[self.col:]
                 self.col += 1
-        self.lines[self.row] = "".join(current_line)
 
     def handle_command_mode_key(self, key):
         if key == curses.KEY_ENTER or key == 10:
@@ -220,31 +242,85 @@ class Editor:
         except Exception as e:
             self.command_buffer = f"Error loading: {e}"
 
-def main(stdscr, input_sequence=None, output_file=None):
+def main(stdscr):
     filename = None
     if len(sys.argv) > 1:
         filename = sys.argv[1]
     editor = Editor(stdscr, filename)
-
-    if input_sequence:
-        # Simulate key presses for testing
-        for char in input_sequence:
-            editor.handle_key(ord(char))
-            editor.stdscr.refresh() # Refresh after each key press
-
-        # After processing input, save content to output_file
-        if output_file:
-            with open(output_file, 'w') as f:
-                for line in editor.lines:
-                    f.write(line + '\n')
-
-        editor.should_exit = True # Exit after simulated input
-
     editor.run()
+
+# New function for testing without curses wrapper
+def run_editor_for_test(input_sequence, initial_lines=None):
+    class MockStdscr:
+        def __init__(self):
+            self._screen = []
+            self._cursor_pos = (0, 0)
+            self._max_y = 24
+            self._max_x = 80
+
+        def addstr(self, y, x, text, attr=0):
+            # Simulate drawing on screen
+            if y < self._max_y:
+                # Ensure the screen has enough rows
+                while len(self._screen) <= y:
+                    self._screen.append('')
+                
+                current_line = list(self._screen[y])
+                # Ensure the current line has enough columns
+                while len(current_line) < x:
+                    current_line.extend([' '] * (x - len(current_line)))
+                
+                # Replace characters at the specified position
+                for i, char in enumerate(text):
+                    if x + i < self._max_x:
+                        if len(current_line) <= x + i:
+                            current_line.extend([' '] * (x + i - len(current_line) + 1))
+                        current_line[x + i] = char
+                self._screen[y] = "".join(current_line)
+
+        def clear(self):
+            self._screen = []
+
+        def erase(self):
+            self._screen = []
+
+        def getmaxyx(self):
+            return self._max_y, self._max_x
+
+        def move(self, y, x):
+            self._cursor_pos = (y, x)
+
+        def refresh(self):
+            pass # No actual refresh in mock
+
+        def nodelay(self, arg):
+            pass
+
+        def keypad(self, arg):
+            pass
+
+        def getch(self):
+            return -1 # Not used in simulated input
+
+    mock_stdscr = MockStdscr()
+    editor = Editor(mock_stdscr)
+    if initial_lines:
+        editor.lines = initial_lines
+
+    for key_code in input_sequence:
+        editor.handle_key(key_code)
+
+    return editor.lines
 
 if __name__ == '__main__':
     try:
-        curses.wrapper(main)
+        # Check if running in a test context
+        if len(sys.argv) > 1 and sys.argv[1] == "--test":
+            # This block is for direct testing calls, not for curses.wrapper
+            # The test scripts will call run_editor_for_test directly
+            pass
+        else:
+            curses.wrapper(main)
     except curses.error as e:
         print(f"Error initializing curses: {e}. Please ensure your terminal supports curses and is large enough.")
 
