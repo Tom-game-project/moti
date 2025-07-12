@@ -35,14 +35,17 @@ class Editor:
                 self.draw_status_bar(max_y, max_x)
                 self.draw_command_line(max_y, max_x)
                 
+                # Calculate line number width
+                line_num_width = len(str(len(self.lines))) + 2 # e.g., ' 1 ' or ' 100 '
+
                 self.row = min(self.row, max_y - 2) # -2 for status bar and command line
-                self.col = min(self.col, max_x - 1)
+                self.col = min(self.col, max_x - 1 - line_num_width) # Adjust for line number width
                 if self.row < len(self.lines):
                     self.col = min(self.col, len(self.lines[self.row]))
                 else:
                     self.col = 0
 
-                self.stdscr.move(self.row, self.col)
+                self.stdscr.move(self.row, self.col + line_num_width) # Adjust cursor position
                 curses.doupdate() # Update the physical screen
 
                 key = self.stdscr.getch()
@@ -58,11 +61,14 @@ class Editor:
                 pass
 
     def draw_text(self, max_y, max_x):
+        line_num_width = len(str(len(self.lines))) + 2 # e.g., ' 1 ' or ' 100 '
         for i, line in enumerate(self.lines):
             if i < max_y - 2: # Leave space for status bar and command line
-                display_line = line[:max_x]
+                line_num_str = f"{i+1}".rjust(line_num_width - 1) + " " # Right-align line number
+                display_line = line[:max_x - line_num_width]
                 try:
-                    self.stdscr.addstr(i, 0, display_line.ljust(max_x))
+                    self.stdscr.addstr(i, 0, line_num_str, curses.A_REVERSE)
+                    self.stdscr.addstr(i, line_num_width, display_line.ljust(max_x - line_num_width))
                 except curses.error:
                     pass
 
@@ -263,7 +269,7 @@ def run_editor_for_test(input_sequence, initial_lines=None):
             if y < self._max_y:
                 # Ensure the screen has enough rows
                 while len(self._screen) <= y:
-                    self._screen.append('')
+                    self._screen.append("")
                 
                 current_line = list(self._screen[y])
                 # Ensure the current line has enough columns
