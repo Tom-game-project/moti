@@ -62,11 +62,10 @@ class Editor:
                 self.draw_status_bar(max_y, max_x)
                 self.draw_command_line(max_y, max_x)
                 
-                # Cursor logic
+                # Cursor logic: move cursor, then set visibility
                 if self.tree_view_active:
                     curses.curs_set(0) # Hide cursor in tree view
                 else:
-                    curses.curs_set(1) # Show cursor in editor
                     line_num_width = len(str(len(self.lines))) + 2
                     
                     # Constrain cursor to valid positions
@@ -76,8 +75,9 @@ class Editor:
                     self.col = max(0, min(self.col, current_line_len))
                     self.col = max(0, min(self.col, editor_win_width - line_num_width - 1))
 
-                    # Move cursor using absolute screen coordinates
+                    # Move cursor to its final position before making it visible
                     self.stdscr.move(self.row, editor_win_x + self.col + line_num_width)
+                    curses.curs_set(1) # Show cursor at its final position
 
                 curses.doupdate() # Update the physical screen once
 
@@ -123,6 +123,7 @@ class Editor:
     def draw_tree_view(self, max_y, max_x):
         """Draws the directory tree view on the left side of the screen."""
         tree_win = self.stdscr.subwin(max_y - 2, self.tree_width, 0, 0)
+        tree_win.leaveok(True)
         tree_win.erase()
 
         for i, item in enumerate(self.tree_items[self.tree_scroll_pos:]):
@@ -146,16 +147,19 @@ class Editor:
 
     def draw_text(self, editor_win, max_y, max_x):
         line_num_width = len(str(len(self.lines))) + 2 # e.g., ' 1 ' or ' 100 '
+        editor_win.leaveok(True)
         editor_win.erase()
-        for i, line in enumerate(self.lines):
-            if i < max_y - 2: # Leave space for status bar and command line
-                line_num_str = f"{i+1}".rjust(line_num_width - 1) + " " # Right-align line number
+        for i in range(max_y): # Iterate over the height of the editor window
+            if i < len(self.lines):
+                line = self.lines[i]
+                line_num_str = f"{i+1}".rjust(line_num_width - 1) + " "
                 display_line = line[:max_x - line_num_width]
                 try:
                     editor_win.addstr(i, 0, line_num_str, curses.A_REVERSE)
                     editor_win.addstr(i, line_num_width, display_line.ljust(max_x - line_num_width))
                 except curses.error:
                     pass
+            # No else needed, erase() already cleared the rest of the window
         editor_win.noutrefresh()
 
     def draw_status_bar(self, max_y, max_x):
