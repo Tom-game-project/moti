@@ -20,6 +20,16 @@ class Editor:
         self.command_buffer = ""
         self.should_exit = False
 
+        # --- Directory Tree Properties ---
+        self.tree_view_active = True  # Start with tree view active
+        self.tree_width = 30
+        self.current_path = os.getcwd()
+        self.tree_scroll_pos = 0
+        self.selected_item_index = 0
+        # Use a set for efficient add/remove
+        self.expanded_dirs = {self.current_path}
+        self.tree_items = []
+
     def run(self):
         self.stdscr.nodelay(1)
         self.stdscr.keypad(True)
@@ -29,48 +39,124 @@ class Editor:
             try:
                 max_y, max_x = self.stdscr.getmaxyx()
 
-                # Use noutrefresh and doupdate for smoother updates
-                self.stdscr.erase() # Use erase instead of clear
-                self.draw_text(max_y, max_x)
+                self.stdscr.erase() # Erase screen to prevent artifacts
+
+                if self.tree_view_active:
+                    self._update_tree_items()
+                    self.draw_tree_view(max_y, max_x)
+
+                # Draw separator line
+                separator_x = self.tree_width
+                for y in range(max_y - 2): # Avoid status and command bar
+                    try:
+                        self.stdscr.addch(y, separator_x, curses.ACS_VLINE)
+                    except curses.error:
+                        pass # Ignore errors at screen edges
+                
+                editor_win_x = self.tree_width + 1
+                editor_win_width = max_x - editor_win_x
+                editor_win_height = max_y - 2
+                editor_win = self.stdscr.subwin(editor_win_height, editor_win_width, 0, editor_win_x)
+
+                self.draw_text(editor_win, editor_win_height, editor_win_width)
                 self.draw_status_bar(max_y, max_x)
                 self.draw_command_line(max_y, max_x)
                 
-                # Calculate line number width
-                line_num_width = len(str(len(self.lines))) + 2 # e.g., ' 1 ' or ' 100 '
-
-                self.row = min(self.row, max_y - 2) # -2 for status bar and command line
-                self.col = min(self.col, max_x - 1 - line_num_width) # Adjust for line number width
-                if self.row < len(self.lines):
-                    self.col = min(self.col, len(self.lines[self.row]))
+                # Cursor logic
+                if self.tree_view_active:
+                    curses.curs_set(0) # Hide cursor in tree view
                 else:
-                    self.col = 0
+                    curses.curs_set(1) # Show cursor in editor
+                    line_num_width = len(str(len(self.lines))) + 2
+                    
+                    # Constrain cursor to valid positions
+                    self.row = max(0, min(self.row, len(self.lines) - 1))
+                    self.row = max(0, min(self.row, editor_win_height - 1))
+                    current_line_len = len(self.lines[self.row])
+                    self.col = max(0, min(self.col, current_line_len))
+                    self.col = max(0, min(self.col, editor_win_width - line_num_width - 1))
 
-                self.stdscr.move(self.row, self.col + line_num_width) # Adjust cursor position
-                curses.doupdate() # Update the physical screen
+                    # Move cursor using absolute screen coordinates
+                    self.stdscr.move(self.row, editor_win_x + self.col + line_num_width)
+
+                curses.doupdate() # Update the physical screen once
 
                 key = self.stdscr.getch()
                 if key != -1:
                     if self.mode == 'command':
                         self.handle_command_mode_key(key)
+                    elif self.tree_view_active:
+                        self.handle_tree_view_key(key)
                     else:
-                        if key == ord('q') and self.mode == 'normal':
-                            self.should_exit = True
                         self.handle_key(key)
 
             except curses.error:
                 pass
 
-    def draw_text(self, max_y, max_x):
+    def _get_tree_items(self, path, prefix=""):
+        """Recursively builds a list of items for the tree view."""
+        items = []
+        try:
+            # Sort entries, directories first
+            entries = sorted(os.listdir(path))
+            dirs = sorted([d for d in entries if os.path.isdir(os.path.join(path, d))])
+            files = sorted([f for f in entries if os.path.isfile(os.path.join(path, f))])
+            
+            for item_name in dirs + files:
+                full_path = os.path.join(path, item_name)
+                is_dir = os.path.isdir(full_path)
+                
+                # Add the item itself
+                items.append({'path': full_path, 'prefix': prefix, 'is_dir': is_dir})
+
+                # If it's an expanded directory, add its children
+                if is_dir and full_path in self.expanded_dirs:
+                    items.extend(self._get_tree_items(full_path, prefix + "  "))
+        except PermissionError:
+            items.append({'path': os.path.join(path, "[Permission Denied]"), 'prefix': prefix, 'is_dir': False})
+        return items
+
+    def _update_tree_items(self):
+        """Updates the list of items to be displayed in the tree view."""
+        self.tree_items = self._get_tree_items(self.current_path)
+
+    def draw_tree_view(self, max_y, max_x):
+        """Draws the directory tree view on the left side of the screen."""
+        tree_win = self.stdscr.subwin(max_y - 2, self.tree_width, 0, 0)
+        tree_win.erase()
+
+        for i, item in enumerate(self.tree_items[self.tree_scroll_pos:]):
+            if i >= max_y - 2:
+                break
+            
+            display_text = ""
+            if item['is_dir']:
+                # Show '+' for collapsed, '-' for expanded
+                indicator = "-" if item['path'] in self.expanded_dirs else "+"
+                display_text = f"{item['prefix']}{indicator} {os.path.basename(item['path'])}"
+            else:
+                display_text = f"{item['prefix']}  {os.path.basename(item['path'])}"
+
+            display_text = display_text[:self.tree_width-1]
+
+            attr = curses.A_REVERSE if i + self.tree_scroll_pos == self.selected_item_index else curses.A_NORMAL
+            tree_win.addstr(i, 0, display_text.ljust(self.tree_width), attr)
+        
+        tree_win.noutrefresh()
+
+    def draw_text(self, editor_win, max_y, max_x):
         line_num_width = len(str(len(self.lines))) + 2 # e.g., ' 1 ' or ' 100 '
+        editor_win.erase()
         for i, line in enumerate(self.lines):
             if i < max_y - 2: # Leave space for status bar and command line
                 line_num_str = f"{i+1}".rjust(line_num_width - 1) + " " # Right-align line number
                 display_line = line[:max_x - line_num_width]
                 try:
-                    self.stdscr.addstr(i, 0, line_num_str, curses.A_REVERSE)
-                    self.stdscr.addstr(i, line_num_width, display_line.ljust(max_x - line_num_width))
+                    editor_win.addstr(i, 0, line_num_str, curses.A_REVERSE)
+                    editor_win.addstr(i, line_num_width, display_line.ljust(max_x - line_num_width))
                 except curses.error:
                     pass
+        editor_win.noutrefresh()
 
     def draw_status_bar(self, max_y, max_x):
         mode_str = f"-- {self.mode.upper()} --"
@@ -86,6 +172,30 @@ class Editor:
             self.stdscr.addstr(max_y - 1, 0, f":{self.command_buffer}".ljust(max_x), curses.A_NORMAL)
         except curses.error:
             pass
+
+    def handle_tree_view_key(self, key):
+        if key == ord('j') or key == curses.KEY_DOWN:
+            self.selected_item_index = min(len(self.tree_items) - 1, self.selected_item_index + 1)
+        elif key == ord('k') or key == curses.KEY_UP:
+            self.selected_item_index = max(0, self.selected_item_index - 1)
+        elif key == curses.KEY_ENTER or key == 10:
+            if self.selected_item_index < len(self.tree_items):
+                selected = self.tree_items[self.selected_item_index]
+                if selected['is_dir']:
+                    # Toggle expansion
+                    if selected['path'] in self.expanded_dirs:
+                        self.expanded_dirs.remove(selected['path'])
+                    else:
+                        self.expanded_dirs.add(selected['path'])
+                    self._update_tree_items() # Rebuild the tree
+                else:
+                    # Load file and switch to editor view
+                    self.load_file(selected['path'])
+                    self.tree_view_active = False
+        elif key == ord('q'):
+            self.should_exit = True
+        elif key == 9: # Tab key
+            self.tree_view_active = not self.tree_view_active
 
     def handle_key(self, key):
         if self.mode == 'normal':
@@ -140,6 +250,8 @@ class Editor:
         elif key == ord(':'):
             self.mode = 'command'
             self.command_buffer = ""
+        elif key == 9: # Tab key
+            self.tree_view_active = not self.tree_view_active
 
     def handle_insert_mode_key(self, key):
         current_line_str = self.lines[self.row]
