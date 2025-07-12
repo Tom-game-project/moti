@@ -8,7 +8,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
@@ -132,16 +132,36 @@ impl Editor {
             let scroll_offset_col = self.scroll_offset_col;
 
             if self.tree_view_active && tree_visible {
-                terminal.hide_cursor()?;
+                let _ = terminal.hide_cursor();
             } else if let Some(buffer) = self.active_buffer() {
-                terminal.show_cursor()?;
-                let editor_win_x = if tree_visible { tree_width + 1 } else { 0 };
+                let _ = terminal.show_cursor();
+                
+                // Replicate layout calculation to get the text_buffer_area
+                let main_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(if tree_visible {
+                        vec![Constraint::Length(tree_width), Constraint::Min(0)]
+                    } else {
+                        vec![Constraint::Min(0)]
+                    })
+                    .split(terminal.size()?);
+
+                let editor_area_index = if tree_visible { 1 } else { 0 };
+                let editor_area = main_chunks[editor_area_index];
+
+                let editor_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(1)].as_ref())
+                    .split(editor_area);
+
+                let text_buffer_area = editor_chunks[0];
+
                 let line_num_width = buffer.lines.len().to_string().len() + 2;
-                let cursor_x = editor_win_x + line_num_width as u16 + buffer.col as u16 - scroll_offset_col as u16;
-                let cursor_y = buffer.row as u16 - buffer.top_row as u16;
+                let cursor_x = text_buffer_area.x + 1 + line_num_width as u16 + (buffer.col as u16).saturating_sub(scroll_offset_col as u16);
+                let cursor_y = text_buffer_area.y + 1 + (buffer.row as u16).saturating_sub(buffer.top_row as u16);
                 let _ = terminal.set_cursor(cursor_x, cursor_y);
             } else {
-                terminal.hide_cursor()?;
+                let _ = terminal.hide_cursor();
             }
 
             if event::poll(Duration::from_millis(100))? {
@@ -456,10 +476,29 @@ impl Editor {
         let text_buffer_area = editor_chunks[0];
         let scroll_offset_col = self.scroll_offset_col; // Store in local variable
         if let Some(buffer) = self.active_buffer() {
-            let buffer_content: Vec<Line> = buffer.lines.iter().map(|line| Line::from(line.as_str())).collect();
+            let mut buffer_content: Vec<Line> = Vec::new();
+            let line_num_width = buffer.lines.len().to_string().len() + 2; // Calculate for rendering
+
+            for (i, line) in buffer.lines.iter().enumerate().skip(buffer.top_row) {
+                if i - buffer.top_row >= text_buffer_area.height as usize { break; }
+
+                let line_number_str = format!("{:>width$} ", i + 1, width = line_num_width - 1); // Right-align, add space
+                let line_number_span = Span::styled(line_number_str, Style::default().fg(Color::DarkGray)); // Style line numbers
+
+                // Handle horizontal scrolling for the text content
+                let display_line_content = if scroll_offset_col < line.len() {
+                    &line[scroll_offset_col..]
+                } else {
+                    ""
+                };
+                let text_span = Span::raw(display_line_content);
+
+                buffer_content.push(Line::from(vec![line_number_span, text_span]));
+            }
+
             let paragraph = Paragraph::new(buffer_content)
                 .block(Block::default().borders(Borders::ALL).title("Editor"))
-                .scroll((buffer.top_row as u16, scroll_offset_col as u16));
+                .scroll((0, 0)); // Scroll is handled by slicing the string and top_row
             f.render_widget(paragraph, text_buffer_area);
         }
 

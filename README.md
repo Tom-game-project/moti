@@ -1,20 +1,31 @@
-# Python Vim-like Editor
+# Rust Vim-like Editor
 
-This is a lightweight, Vim-like text editor implemented in Python using the `curses` library. It features a built-in file explorer tree, allowing you to easily navigate and edit files within your project.
+This is a lightweight, Vim-like text editor implemented in Rust using the `ratatui` and `crossterm` libraries. It features a built-in file explorer tree, allowing you to easily navigate and edit files within your project.
 
 ## How to Run
 
-To start the editor, simply run the `editor.py` script from your terminal:
+To build and run the editor, navigate to the project root and use Cargo:
 
 ```bash
-python editor.py
+cargo build --manifest-path rust_editor/Cargo.toml
+./rust_editor/target/debug/rust_editor
 ```
 
-You can also open a specific file by passing its name as an argument:
+Alternatively, you can run directly:
 
 ```bash
-python editor.py /path/to/your/file.txt
+cargo run --manifest-path rust_editor/Cargo.toml
 ```
+
+To open a specific file when starting the editor (this feature is not yet implemented in Rust version, but planned):
+
+```bash
+# Planned: ./rust_editor/target/debug/rust_editor /path/to/your/file.txt
+```
+
+## Features
+
+*   **Line Numbers**: Displays line numbers next to the text content.
 
 ## Key Bindings
 
