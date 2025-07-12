@@ -32,14 +32,20 @@ The editor starts in the Tree View, which is displayed on the left side of the s
 | `Tab` | Switch focus between the Tree View and the Editor View. |
 | `q` | Quit the application. |
 
-### モード共通
+### Global Commands
 
-| Key | Action |
+| Key / Command | Action |
 | :--- | :--- |
 | `Tab` | Switch focus between the Tree View and the Editor View. |
-| `:q` | Quit the application. |
+| `:q` | Quit the application. Fails if there are unsaved changes. |
+| `:q!` | Quit without saving changes. |
 | `:w` | Save the current file. |
+| `:w <filename>` | Save the current file to a new filename. |
 | `:wq` | Save and quit. |
+| `:e <filename>` | Open a file for editing. |
+| `:bn` | Switch to the **n**ext buffer (file). |
+| `:bp` | Switch to the **p**revious buffer (file). |
+| `:tt` | **T**oggle the directory **t**ree view on or off. |
 
 ###  Normal Mode (Editor View)
 
