@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Padding, Paragraph},
     Frame, Terminal,
 };
 
@@ -154,16 +154,22 @@ impl Editor {
 
     /// Updates vertical and horizontal scroll offsets based on cursor position.
     fn update_scroll_offsets(&mut self, term_size: Rect) {
-        let editor_area = {
+        let editor_area = if self.tree_visible {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints(if self.tree_visible {
-                    vec![Constraint::Length(self.tree_width), Constraint::Min(0)]
-                } else {
-                    vec![Constraint::Min(0)]
-                })
+                .constraints([
+                    Constraint::Length(self.tree_width), // Tree
+                    Constraint::Length(1),               // Separator
+                    Constraint::Min(0),                  // Editor
+                ])
                 .split(term_size);
-            if self.tree_visible { chunks[1] } else { chunks[0] }
+            chunks[2]
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0)])
+                .split(term_size);
+            chunks[0]
         };
 
         let text_area = {
@@ -176,8 +182,9 @@ impl Editor {
 
         // First, calculate the new horizontal scroll offset using an immutable borrow
         let new_scroll_offset_col = if let Some(buffer) = self.buffers.get(self.active_buffer_index) {
+            // UI MOD: Adjust content_width calculation for no borders
             let line_num_width = buffer.lines.len().to_string().len() + 2;
-            let content_width = text_area.width.saturating_sub(2).saturating_sub(line_num_width as u16);
+            let content_width = text_area.width.saturating_sub(line_num_width as u16);
             let mut new_offset = self.scroll_offset_col;
 
             if buffer.col < new_offset {
@@ -193,7 +200,8 @@ impl Editor {
 
         // Now, get a mutable borrow to update the vertical scroll
         if let Some(buffer) = self.active_buffer() {
-            let editor_height = text_area.height.saturating_sub(2); // -2 for borders
+            // UI MOD: Adjust editor_height calculation for no borders
+            let editor_height = text_area.height;
             if buffer.row < buffer.top_row {
                 buffer.top_row = buffer.row;
             }
@@ -408,7 +416,10 @@ impl Editor {
     }
 
     fn draw_tree_view(&self, f: &mut Frame, area: Rect) {
-        let tree_block = Block::default().borders(Borders::ALL).title("Files");
+        // UI MOD: 枠線をなくし、タイトルと左側のパディングのみに
+        let tree_block = Block::default()
+            .title("Files")
+            .padding(Padding::horizontal(1));
         let inner_area = tree_block.inner(area);
         let mut lines = Vec::new();
 
@@ -429,17 +440,24 @@ impl Editor {
     /// Main UI drawing function.
     fn ui(&mut self, f: &mut Frame) {
         // --- Layouts ---
-        let main_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(if self.tree_visible {
-                vec![Constraint::Length(self.tree_width), Constraint::Min(0)]
-            } else {
-                vec![Constraint::Min(0)]
-            })
-            .split(f.size());
+        // FIX: Create a dedicated chunk for the separator line.
+        let main_chunks = if self.tree_visible {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(self.tree_width), // Tree
+                    Constraint::Length(1),               // Separator
+                    Constraint::Min(0),                  // Editor
+                ])
+                .split(f.size())
+        } else {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0)]) // Editor only
+                .split(f.size())
+        };
 
-        let editor_area_index = if self.tree_visible { 1 } else { 0 };
-        let editor_area = main_chunks[editor_area_index];
+        let editor_area = if self.tree_visible { main_chunks[2] } else { main_chunks[0] };
 
         let editor_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -452,9 +470,10 @@ impl Editor {
         // --- Widgets ---
         if self.tree_visible {
             self.draw_tree_view(f, main_chunks[0]);
-            let separator_x = main_chunks[0].width;
-            for y in 0..f.size().height {
-                f.buffer_mut().get_mut(separator_x, y).set_symbol("│");
+            // FIX: Draw separator in its own dedicated chunk.
+            let separator_area = main_chunks[1];
+            for y in separator_area.y..separator_area.y + separator_area.height.saturating_sub(2) {
+                 f.buffer_mut().get_mut(separator_area.x, y).set_symbol("│");
             }
         }
 
@@ -470,8 +489,8 @@ impl Editor {
                 buffer_content.push(Line::from(vec![line_number_span, text_span]));
             }
 
+            // UI MOD: エディタの枠線とタイトルを削除
             let paragraph = Paragraph::new(buffer_content)
-                .block(Block::default().borders(Borders::ALL).title("Editor"))
                 .scroll((0, self.scroll_offset_col as u16));
             f.render_widget(paragraph, text_buffer_area);
         }
@@ -502,12 +521,12 @@ impl Editor {
         f.render_widget(command_line, Rect::new(status_area.x, status_area.y + 1, status_area.width, 1));
 
         // --- Cursor ---
-        // THIS IS THE FIX: Set the cursor within the `draw` closure.
         if self.mode != Mode::Command && !self.tree_view_active {
             if let Some(buffer) = self.buffers.get(self.active_buffer_index) {
                 let line_num_width = buffer.lines.len().to_string().len() + 2;
-                let cursor_x = text_buffer_area.x + 1 + line_num_width as u16 + (buffer.col as u16).saturating_sub(self.scroll_offset_col as u16);
-                let cursor_y = text_buffer_area.y + 1 + (buffer.row as u16).saturating_sub(buffer.top_row as u16);
+                // UI MOD: 枠線がなくなったため、カーソル位置の計算から+1を削除
+                let cursor_x = text_buffer_area.x + line_num_width as u16 + (buffer.col as u16).saturating_sub(self.scroll_offset_col as u16);
+                let cursor_y = text_buffer_area.y + (buffer.row as u16).saturating_sub(buffer.top_row as u16);
                 f.set_cursor(cursor_x, cursor_y);
             }
         }
