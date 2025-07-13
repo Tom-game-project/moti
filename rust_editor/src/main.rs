@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 use crossterm::{
-    cursor::{SetCursorStyle}, // FIX: Import cursor styling features
+    cursor::SetCursorStyle,
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -18,6 +18,9 @@ use ratatui::{
     widgets::{Block, Padding, Paragraph},
     Frame, Terminal,
 };
+// FIX: Import crates for Unicode handling
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(PartialEq, Clone, Debug)]
 enum Mode {
@@ -30,6 +33,7 @@ struct Buffer {
     filename: Option<PathBuf>,
     lines: Vec<String>,
     row: usize,
+    /// col is now the grapheme index, not the byte index.
     col: usize,
     top_row: usize,
     modified: bool,
@@ -124,7 +128,7 @@ impl Editor {
             // Draw UI
             terminal.draw(|f| self.ui(f))?;
 
-            // FIX: Set cursor style based on the current mode
+            // Set cursor style based on the current mode
             match self.mode {
                 Mode::Insert => {
                     execute!(terminal.backend_mut(), SetCursorStyle::BlinkingBar)?;
@@ -158,8 +162,9 @@ impl Editor {
     fn clamp_cursor_position(&mut self) {
         if let Some(buffer) = self.active_buffer() {
             buffer.row = buffer.row.min(buffer.lines.len().saturating_sub(1));
-            let current_line_len = buffer.lines.get(buffer.row).map_or(0, |line| line.len());
-            buffer.col = buffer.col.min(current_line_len);
+            // FIX: Clamp column based on grapheme count, not byte length.
+            let grapheme_count = buffer.lines[buffer.row].graphemes(true).count();
+            buffer.col = buffer.col.min(grapheme_count);
         }
     }
 
@@ -193,16 +198,19 @@ impl Editor {
 
         // First, calculate the new horizontal scroll offset using an immutable borrow
         let new_scroll_offset_col = if let Some(buffer) = self.buffers.get(self.active_buffer_index) {
-            // UI MOD: Adjust content_width calculation for no borders
             let line_num_width = buffer.lines.len().to_string().len() + 2;
             let content_width = text_area.width.saturating_sub(line_num_width as u16);
-            let mut new_offset = self.scroll_offset_col;
+            
+            // FIX: Calculate scroll based on visual width, not column index.
+            let pre_cursor_text: String = buffer.lines[buffer.row].graphemes(true).take(buffer.col).collect();
+            let pre_cursor_width = UnicodeWidthStr::width(pre_cursor_text.as_str());
 
-            if buffer.col < new_offset {
-                new_offset = buffer.col;
+            let mut new_offset = self.scroll_offset_col;
+            if pre_cursor_width < new_offset {
+                new_offset = pre_cursor_width;
             }
-            if buffer.col >= new_offset + content_width as usize {
-                new_offset = buffer.col - content_width as usize + 1;
+            if pre_cursor_width >= new_offset + content_width as usize {
+                new_offset = pre_cursor_width - content_width as usize + 1;
             }
             Some(new_offset)
         } else {
@@ -211,7 +219,6 @@ impl Editor {
 
         // Now, get a mutable borrow to update the vertical scroll
         if let Some(buffer) = self.active_buffer() {
-            // UI MOD: Adjust editor_height calculation for no borders
             let editor_height = text_area.height;
             if buffer.row < buffer.top_row {
                 buffer.top_row = buffer.row;
@@ -270,8 +277,11 @@ impl Editor {
             }
             KeyCode::Char('x') => {
                 if let Some(buffer) = self.active_buffer() {
-                    if buffer.col < buffer.lines[buffer.row].len() {
-                        buffer.lines[buffer.row].remove(buffer.col);
+                    // FIX: Delete by grapheme.
+                    let mut graphemes: Vec<&str> = buffer.lines[buffer.row].graphemes(true).collect();
+                    if buffer.col < graphemes.len() {
+                        graphemes.remove(buffer.col);
+                        buffer.lines[buffer.row] = graphemes.join("");
                         buffer.modified = true;
                     }
                 }
@@ -309,20 +319,25 @@ impl Editor {
             match key_code {
                 KeyCode::Esc => return Mode::Normal,
                 KeyCode::Enter => {
-                    let current_line = &mut buffer.lines[buffer.row];
-                    let new_line = current_line.split_off(buffer.col);
+                    // FIX: Split line at the correct byte index for the grapheme.
+                    let line = &mut buffer.lines[buffer.row];
+                    let byte_idx = line.grapheme_indices(true).nth(buffer.col).map_or(line.len(), |(i, _)| i);
+                    let new_line = line.split_off(byte_idx);
                     buffer.lines.insert(buffer.row + 1, new_line);
                     buffer.row += 1;
                     buffer.col = 0;
                 }
                 KeyCode::Backspace => {
                     if buffer.col > 0 {
+                        // FIX: Remove previous grapheme.
+                        let mut graphemes: Vec<&str> = buffer.lines[buffer.row].graphemes(true).collect();
                         buffer.col -= 1;
-                        buffer.lines[buffer.row].remove(buffer.col);
+                        graphemes.remove(buffer.col);
+                        buffer.lines[buffer.row] = graphemes.join("");
                     } else if buffer.row > 0 {
                         let prev_line = buffer.lines.remove(buffer.row);
                         buffer.row -= 1;
-                        buffer.col = buffer.lines[buffer.row].len();
+                        buffer.col = buffer.lines[buffer.row].graphemes(true).count();
                         buffer.lines[buffer.row].push_str(&prev_line);
                     }
                 }
@@ -331,7 +346,12 @@ impl Editor {
                 KeyCode::Up => buffer.row = buffer.row.saturating_sub(1),
                 KeyCode::Down => buffer.row += 1,
                 KeyCode::Char(c) => {
-                    buffer.lines[buffer.row].insert(buffer.col, c);
+                    // FIX: Insert by grapheme.
+                    let mut graphemes: Vec<&str> = buffer.lines[buffer.row].graphemes(true).collect();
+                    let char_str = c.to_string();
+                    graphemes.insert(buffer.col, &char_str);
+                    // This is a bit inefficient, but safe.
+                    buffer.lines[buffer.row] = graphemes.join("");
                     buffer.col += 1;
                 }
                 _ => buffer.modified = false, // No change for other keys
@@ -427,7 +447,6 @@ impl Editor {
     }
 
     fn draw_tree_view(&self, f: &mut Frame, area: Rect) {
-        // UI MOD: 枠線をなくし、タイトルと左側のパディングのみに
         let tree_block = Block::default()
             .title("ファイル")
             .padding(Padding::horizontal(1));
@@ -451,7 +470,6 @@ impl Editor {
     /// Main UI drawing function.
     fn ui(&mut self, f: &mut Frame) {
         // --- Layouts ---
-        // FIX: Create a dedicated chunk for the separator line.
         let main_chunks = if self.tree_visible {
             Layout::default()
                 .direction(Direction::Horizontal)
@@ -481,7 +499,6 @@ impl Editor {
         // --- Widgets ---
         if self.tree_visible {
             self.draw_tree_view(f, main_chunks[0]);
-            // FIX: Draw separator in its own dedicated chunk.
             let separator_area = main_chunks[1];
             for y in separator_area.y..separator_area.y + separator_area.height.saturating_sub(2) {
                  f.buffer_mut().get_mut(separator_area.x, y).set_symbol("│");
@@ -500,7 +517,6 @@ impl Editor {
                 buffer_content.push(Line::from(vec![line_number_span, text_span]));
             }
 
-            // UI MOD: エディタの枠線とタイトルを削除
             let paragraph = Paragraph::new(buffer_content)
                 .scroll((0, self.scroll_offset_col as u16));
             f.render_widget(paragraph, text_buffer_area);
@@ -535,8 +551,11 @@ impl Editor {
         if self.mode != Mode::Command && !self.tree_view_active {
             if let Some(buffer) = self.buffers.get(self.active_buffer_index) {
                 let line_num_width = buffer.lines.len().to_string().len() + 2;
-                // UI MOD: 枠線がなくなったため、カーソル位置の計算から+1を削除
-                let cursor_x = text_buffer_area.x + line_num_width as u16 + (buffer.col as u16).saturating_sub(self.scroll_offset_col as u16);
+                // FIX: Calculate cursor X position based on the visual width of graphemes.
+                let pre_cursor_text: String = buffer.lines[buffer.row].graphemes(true).take(buffer.col).collect();
+                let pre_cursor_width = UnicodeWidthStr::width(pre_cursor_text.as_str());
+
+                let cursor_x = text_buffer_area.x + line_num_width as u16 + (pre_cursor_width as u16).saturating_sub(self.scroll_offset_col as u16);
                 let cursor_y = text_buffer_area.y + (buffer.row as u16).saturating_sub(buffer.top_row as u16);
                 f.set_cursor(cursor_x, cursor_y);
             }
