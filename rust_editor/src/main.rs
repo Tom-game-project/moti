@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 use crossterm::{
+    cursor::{SetCursorStyle}, // FIX: Import cursor styling features
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -122,6 +123,16 @@ impl Editor {
 
             // Draw UI
             terminal.draw(|f| self.ui(f))?;
+
+            // FIX: Set cursor style based on the current mode
+            match self.mode {
+                Mode::Insert => {
+                    execute!(terminal.backend_mut(), SetCursorStyle::BlinkingBar)?;
+                }
+                _ => { // Normal, Command
+                    execute!(terminal.backend_mut(), SetCursorStyle::BlinkingBlock)?;
+                }
+            }
 
             // Handle input events
             if event::poll(Duration::from_millis(100))? {
@@ -418,7 +429,7 @@ impl Editor {
     fn draw_tree_view(&self, f: &mut Frame, area: Rect) {
         // UI MOD: 枠線をなくし、タイトルと左側のパディングのみに
         let tree_block = Block::default()
-            .title("Files")
+            .title("ファイル")
             .padding(Padding::horizontal(1));
         let inner_area = tree_block.inner(area);
         let mut lines = Vec::new();
@@ -660,8 +671,14 @@ fn main() -> io::Result<()> {
     let mut editor = Editor::new();
     let res = editor.run(&mut terminal);
 
+    // restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        // FIX: Reset cursor to default shape on exit
+        SetCursorStyle::DefaultUserShape
+    )?;
     terminal.show_cursor()?;
 
     if let Err(err) = res {
