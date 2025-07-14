@@ -78,13 +78,10 @@ impl PluginManager {
 
     /// 指定されたパスからWasmプラグインを読み込み、初期化する
     fn load_plugin(&self, path: &PathBuf, effect_sender: Sender<PluginEffect>) -> Result<()> {
-        // Storeを初期化。プラグインからは直接Editorを触らせない
         let mut store = Store::new(&self.engine, ());
         
-        // ホスト関数をWasmに公開するためのLinker
         let mut linker = Linker::new(&self.engine);
 
-        // --- `echo`関数を "host" モジュールとして公開 ---
         let effect_sender_clone = effect_sender.clone();
         linker.func_wrap(
             "host",
@@ -92,26 +89,19 @@ impl PluginManager {
             move |mut caller: Caller<'_, ()>, ptr: i32, len: i32| {
                 let mem = match caller.get_export("memory") {
                     Some(Extern::Memory(mem)) => mem,
-                    _ => return, // Or handle error
+                    _ => return,
                 };
                 let mut buffer = vec![0; len as usize];
                 if mem.read(&caller, ptr as usize, &mut buffer).is_ok() {
                     if let Ok(message) = String::from_utf8(buffer) {
-                        // メッセージをチャネル経由でホストに送信
                         effect_sender_clone.send(PluginEffect::Echo(message)).unwrap();
                     }
                 }
             },
         )?;
-        // --- ここまで ---
 
-        // Wasmモジュールをファイルから読み込む
         let module = Module::from_file(&self.engine, path)?;
-        
-        // モジュールをインスタンス化
         let instance = linker.instantiate(&mut store, &module)?;
-        
-        // プラグインの `init` 関数を取得して呼び出す
         let init_func = instance.get_typed_func::<(), ()>(&mut store, "init")?;
         init_func.call(&mut store, ())?;
 
@@ -185,20 +175,18 @@ impl Editor {
         Ok(editor)
     }
 
-    /// すべてのプラグインを読み込む
-    fn load_plugins(&self) {
-        // TODO: 将来的には `plugins` ディレクトリを探索するなど動的に
+    // FIX: &mut self に変更し、command_message を直接更新する
+    fn load_plugins(&mut self) {
         let plugin_path = PathBuf::from("./plugin.wasm");
         if plugin_path.exists() {
             if let Err(e) = self.plugin_manager.load_plugin(&plugin_path, self.plugin_event_sender.clone()) {
-                self.set_command_message(format!("Failed to load plugin: {}", e));
+                self.command_message = format!("Failed to load plugin: {}", e);
             }
         } else {
-            self.set_command_message("plugin.wasm not found. Skipping plugin load.".to_string());
+            self.command_message = "plugin.wasm not found. Skipping plugin load.".to_string();
         }
     }
     
-    /// プラグインからのイベントを処理する
     fn handle_plugin_events(&mut self) {
         while let Ok(effect) = self.plugin_event_receiver.try_recv() {
             match effect {
@@ -207,14 +195,6 @@ impl Editor {
                 }
             }
         }
-    }
-
-    fn set_command_message(&self, msg: String) {
-        // この関数は &self を受け取るため、直接フィールドを書き換えられない。
-        // メッセージ表示のためには、Editor の可変参照が必要になる。
-        // ここではデバッグ目的でコンソールに出力する。
-        // 実際のアプリケーションでは、チャネル経由でUIスレッドにメッセージを送るなどの工夫が必要。
-        eprintln!("UI_MSG: {}", msg);
     }
 
     fn active_buffer(&mut self) -> Option<&mut Buffer> {
@@ -230,32 +210,33 @@ impl Editor {
                 return Ok(());
             }
 
-            self.handle_plugin_events(); // プラグインからのイベントを処理
+            self.handle_plugin_events();
 
-            // Update data models before drawing
             if self.tree_visible {
                 self.update_tree_items();
             }
             self.clamp_cursor_position();
             self.update_scroll_offsets(terminal.size()?);
 
-            // Draw UI
             terminal.draw(|f| self.ui(f))?;
 
-            // Set cursor style based on the current mode
             match self.mode {
                 Mode::Insert => {
                     execute!(terminal.backend_mut(), SetCursorStyle::BlinkingBar)?;
                 }
-                _ => { // Normal, Command
+                _ => {
                     execute!(terminal.backend_mut(), SetCursorStyle::BlinkingBlock)?;
                 }
             }
 
-            // Handle input events
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
+                        // FIX: ユーザーが新しいキー操作をしたら、古い通知メッセージをクリアする
+                        if self.mode != Mode::Command {
+                            self.command_message.clear();
+                        }
+
                         if self.tree_view_active && self.tree_visible {
                             self.handle_tree_view_key(key.code);
                         } else {
