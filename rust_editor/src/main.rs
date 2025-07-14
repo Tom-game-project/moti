@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     io,
     path::PathBuf,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use crossterm::{
@@ -18,9 +19,13 @@ use ratatui::{
     widgets::{Block, Padding, Paragraph},
     Frame, Terminal,
 };
-// FIX: Import crates for Unicode handling
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+// --- プラグインシステム用のモジュールを追加 ---
+use wasmtime::*;
+use crossbeam_channel::{unbounded, Receiver, Sender};
+// --- ここまで ---
 
 #[derive(PartialEq, Clone, Debug)]
 enum Mode {
@@ -29,11 +34,17 @@ enum Mode {
     Command,
 }
 
+// --- プラグインがホストに要求する処理を表すenum ---
+#[derive(Debug)]
+enum PluginEffect {
+    Echo(String),
+}
+// --- ここまで ---
+
 struct Buffer {
     filename: Option<PathBuf>,
     lines: Vec<String>,
     row: usize,
-    /// col is now the grapheme index, not the byte index.
     col: usize,
     top_row: usize,
     modified: bool,
@@ -52,6 +63,64 @@ impl Buffer {
     }
 }
 
+// --- Wasmプラグインを管理する構造体 ---
+struct PluginManager {
+    engine: Engine,
+}
+
+impl PluginManager {
+    fn new() -> Result<Self> {
+        let mut config = Config::new();
+        config.wasm_multi_value(true);
+        let engine = Engine::new(&config)?;
+        Ok(Self { engine })
+    }
+
+    /// 指定されたパスからWasmプラグインを読み込み、初期化する
+    fn load_plugin(&self, path: &PathBuf, effect_sender: Sender<PluginEffect>) -> Result<()> {
+        // Storeを初期化。プラグインからは直接Editorを触らせない
+        let mut store = Store::new(&self.engine, ());
+        
+        // ホスト関数をWasmに公開するためのLinker
+        let mut linker = Linker::new(&self.engine);
+
+        // --- `echo`関数を "host" モジュールとして公開 ---
+        let effect_sender_clone = effect_sender.clone();
+        linker.func_wrap(
+            "host",
+            "echo",
+            move |mut caller: Caller<'_, ()>, ptr: i32, len: i32| {
+                let mem = match caller.get_export("memory") {
+                    Some(Extern::Memory(mem)) => mem,
+                    _ => return, // Or handle error
+                };
+                let mut buffer = vec![0; len as usize];
+                if mem.read(&caller, ptr as usize, &mut buffer).is_ok() {
+                    if let Ok(message) = String::from_utf8(buffer) {
+                        // メッセージをチャネル経由でホストに送信
+                        effect_sender_clone.send(PluginEffect::Echo(message)).unwrap();
+                    }
+                }
+            },
+        )?;
+        // --- ここまで ---
+
+        // Wasmモジュールをファイルから読み込む
+        let module = Module::from_file(&self.engine, path)?;
+        
+        // モジュールをインスタンス化
+        let instance = linker.instantiate(&mut store, &module)?;
+        
+        // プラグインの `init` 関数を取得して呼び出す
+        let init_func = instance.get_typed_func::<(), ()>(&mut store, "init")?;
+        init_func.call(&mut store, ())?;
+
+        Ok(())
+    }
+}
+// --- ここまで ---
+
+
 struct TreeItem {
     path: PathBuf,
     prefix: String,
@@ -68,6 +137,12 @@ struct Editor {
     should_exit: bool,
     pending_command_prefix: Option<char>,
 
+    // --- プラグイン関連のフィールド ---
+    plugin_manager: PluginManager,
+    plugin_event_receiver: Receiver<PluginEffect>,
+    plugin_event_sender: Sender<PluginEffect>,
+    // --- ここまで ---
+
     // Directory Tree Properties
     tree_visible: bool,
     tree_view_active: bool,
@@ -80,7 +155,8 @@ struct Editor {
 }
 
 impl Editor {
-    fn new() -> Editor {
+    fn new() -> Result<Self> {
+        let (tx, rx) = unbounded();
         let mut editor = Editor {
             buffers: Vec::new(),
             active_buffer_index: 0,
@@ -90,8 +166,10 @@ impl Editor {
             scroll_offset_col: 0,
             should_exit: false,
             pending_command_prefix: None,
+            plugin_manager: PluginManager::new()?,
+            plugin_event_receiver: rx,
+            plugin_event_sender: tx,
 
-            // Directory Tree Properties
             tree_visible: true,
             tree_view_active: true,
             tree_width: 30,
@@ -103,8 +181,40 @@ impl Editor {
         };
         editor.expanded_dirs.insert(editor.current_path.clone());
         editor.open_file_in_new_buffer(None);
-        editor.command_message.clear(); // Clear initial open message
-        editor
+        editor.command_message.clear();
+        Ok(editor)
+    }
+
+    /// すべてのプラグインを読み込む
+    fn load_plugins(&self) {
+        // TODO: 将来的には `plugins` ディレクトリを探索するなど動的に
+        let plugin_path = PathBuf::from("./plugin.wasm");
+        if plugin_path.exists() {
+            if let Err(e) = self.plugin_manager.load_plugin(&plugin_path, self.plugin_event_sender.clone()) {
+                self.set_command_message(format!("Failed to load plugin: {}", e));
+            }
+        } else {
+            self.set_command_message("plugin.wasm not found. Skipping plugin load.".to_string());
+        }
+    }
+    
+    /// プラグインからのイベントを処理する
+    fn handle_plugin_events(&mut self) {
+        while let Ok(effect) = self.plugin_event_receiver.try_recv() {
+            match effect {
+                PluginEffect::Echo(message) => {
+                    self.command_message = message;
+                }
+            }
+        }
+    }
+
+    fn set_command_message(&self, msg: String) {
+        // この関数は &self を受け取るため、直接フィールドを書き換えられない。
+        // メッセージ表示のためには、Editor の可変参照が必要になる。
+        // ここではデバッグ目的でコンソールに出力する。
+        // 実際のアプリケーションでは、チャネル経由でUIスレッドにメッセージを送るなどの工夫が必要。
+        eprintln!("UI_MSG: {}", msg);
     }
 
     fn active_buffer(&mut self) -> Option<&mut Buffer> {
@@ -113,10 +223,14 @@ impl Editor {
 
     /// The main application loop.
     fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+        self.load_plugins(); // アプリケーション起動時にプラグインを読み込む
+
         loop {
             if self.should_exit {
                 return Ok(());
             }
+
+            self.handle_plugin_events(); // プラグインからのイベントを処理
 
             // Update data models before drawing
             if self.tree_visible {
@@ -158,25 +272,23 @@ impl Editor {
         }
     }
 
-    /// Ensures the cursor is within valid bounds of the buffer.
+    // ... (他のメソッドは変更なし) ...
     fn clamp_cursor_position(&mut self) {
         if let Some(buffer) = self.active_buffer() {
             buffer.row = buffer.row.min(buffer.lines.len().saturating_sub(1));
-            // FIX: Clamp column based on grapheme count, not byte length.
             let grapheme_count = buffer.lines[buffer.row].graphemes(true).count();
             buffer.col = buffer.col.min(grapheme_count);
         }
     }
 
-    /// Updates vertical and horizontal scroll offsets based on cursor position.
     fn update_scroll_offsets(&mut self, term_size: Rect) {
         let editor_area = if self.tree_visible {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(self.tree_width), // Tree
-                    Constraint::Length(1),               // Separator
-                    Constraint::Min(0),                  // Editor
+                    Constraint::Length(self.tree_width),
+                    Constraint::Length(1),
+                    Constraint::Min(0),
                 ])
                 .split(term_size);
             chunks[2]
@@ -196,15 +308,11 @@ impl Editor {
             chunks[0]
         };
 
-        // First, calculate the new horizontal scroll offset using an immutable borrow
         let new_scroll_offset_col = if let Some(buffer) = self.buffers.get(self.active_buffer_index) {
             let line_num_width = buffer.lines.len().to_string().len() + 2;
             let content_width = text_area.width.saturating_sub(line_num_width as u16);
-            
-            // FIX: Calculate scroll based on visual width, not column index.
             let pre_cursor_text: String = buffer.lines[buffer.row].graphemes(true).take(buffer.col).collect();
             let pre_cursor_width = UnicodeWidthStr::width(pre_cursor_text.as_str());
-
             let mut new_offset = self.scroll_offset_col;
             if pre_cursor_width < new_offset {
                 new_offset = pre_cursor_width;
@@ -217,7 +325,6 @@ impl Editor {
             None
         };
 
-        // Now, get a mutable borrow to update the vertical scroll
         if let Some(buffer) = self.active_buffer() {
             let editor_height = text_area.height;
             if buffer.row < buffer.top_row {
@@ -228,13 +335,11 @@ impl Editor {
             }
         }
 
-        // Finally, apply the new horizontal offset
         if let Some(new_offset) = new_scroll_offset_col {
             self.scroll_offset_col = new_offset;
         }
     }
 
-    /// Handles key presses in normal mode.
     fn handle_normal_mode_key(&mut self, key_code: KeyCode) -> Mode {
         let pending_prefix = self.pending_command_prefix.take();
 
@@ -277,7 +382,6 @@ impl Editor {
             }
             KeyCode::Char('x') => {
                 if let Some(buffer) = self.active_buffer() {
-                    // FIX: Delete by grapheme.
                     let mut graphemes: Vec<&str> = buffer.lines[buffer.row].graphemes(true).collect();
                     if buffer.col < graphemes.len() {
                         graphemes.remove(buffer.col);
@@ -312,14 +416,12 @@ impl Editor {
         Mode::Normal
     }
 
-    /// Handles key presses in insert mode.
     fn handle_insert_mode_key(&mut self, key_code: KeyCode) -> Mode {
         if let Some(buffer) = self.active_buffer() {
             buffer.modified = true;
             match key_code {
                 KeyCode::Esc => return Mode::Normal,
                 KeyCode::Enter => {
-                    // FIX: Split line at the correct byte index for the grapheme.
                     let line = &mut buffer.lines[buffer.row];
                     let byte_idx = line.grapheme_indices(true).nth(buffer.col).map_or(line.len(), |(i, _)| i);
                     let new_line = line.split_off(byte_idx);
@@ -329,7 +431,6 @@ impl Editor {
                 }
                 KeyCode::Backspace => {
                     if buffer.col > 0 {
-                        // FIX: Remove previous grapheme.
                         let mut graphemes: Vec<&str> = buffer.lines[buffer.row].graphemes(true).collect();
                         buffer.col -= 1;
                         graphemes.remove(buffer.col);
@@ -346,21 +447,18 @@ impl Editor {
                 KeyCode::Up => buffer.row = buffer.row.saturating_sub(1),
                 KeyCode::Down => buffer.row += 1,
                 KeyCode::Char(c) => {
-                    // FIX: Insert by grapheme.
                     let mut graphemes: Vec<&str> = buffer.lines[buffer.row].graphemes(true).collect();
                     let char_str = c.to_string();
                     graphemes.insert(buffer.col, &char_str);
-                    // This is a bit inefficient, but safe.
                     buffer.lines[buffer.row] = graphemes.join("");
                     buffer.col += 1;
                 }
-                _ => buffer.modified = false, // No change for other keys
+                _ => buffer.modified = false,
             }
         }
         Mode::Insert
     }
 
-    /// Handles key presses in command mode.
     fn handle_command_mode_key(&mut self, key_code: KeyCode) -> Mode {
         match key_code {
             KeyCode::Esc => {
@@ -385,7 +483,6 @@ impl Editor {
         Mode::Command
     }
 
-    /// Handles key presses in the tree view.
     fn handle_tree_view_key(&mut self, key_code: KeyCode) {
         match key_code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -417,7 +514,6 @@ impl Editor {
         }
     }
 
-    /// Recursively gets items for the directory tree.
     fn get_tree_items(&self, path: &PathBuf, prefix: String) -> Vec<TreeItem> {
         let mut items = Vec::new();
         if let Ok(entries) = std::fs::read_dir(path) {
@@ -467,22 +563,20 @@ impl Editor {
         f.render_widget(paragraph, area);
     }
 
-    /// Main UI drawing function.
     fn ui(&mut self, f: &mut Frame) {
-        // --- Layouts ---
         let main_chunks = if self.tree_visible {
             Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(self.tree_width), // Tree
-                    Constraint::Length(1),               // Separator
-                    Constraint::Min(0),                  // Editor
+                    Constraint::Length(self.tree_width),
+                    Constraint::Length(1),
+                    Constraint::Min(0),
                 ])
                 .split(f.size())
         } else {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(0)]) // Editor only
+                .constraints([Constraint::Min(0)])
                 .split(f.size())
         };
 
@@ -496,7 +590,6 @@ impl Editor {
         let text_buffer_area = editor_chunks[0];
         let status_area = editor_chunks[1];
 
-        // --- Widgets ---
         if self.tree_visible {
             self.draw_tree_view(f, main_chunks[0]);
             let separator_area = main_chunks[1];
@@ -547,14 +640,11 @@ impl Editor {
         let command_line = Paragraph::new(command_line_text);
         f.render_widget(command_line, Rect::new(status_area.x, status_area.y + 1, status_area.width, 1));
 
-        // --- Cursor ---
         if self.mode != Mode::Command && !self.tree_view_active {
             if let Some(buffer) = self.buffers.get(self.active_buffer_index) {
                 let line_num_width = buffer.lines.len().to_string().len() + 2;
-                // FIX: Calculate cursor X position based on the visual width of graphemes.
                 let pre_cursor_text: String = buffer.lines[buffer.row].graphemes(true).take(buffer.col).collect();
                 let pre_cursor_width = UnicodeWidthStr::width(pre_cursor_text.as_str());
-
                 let cursor_x = text_buffer_area.x + line_num_width as u16 + (pre_cursor_width as u16).saturating_sub(self.scroll_offset_col as u16);
                 let cursor_y = text_buffer_area.y + (buffer.row as u16).saturating_sub(buffer.top_row as u16);
                 f.set_cursor(cursor_x, cursor_y);
@@ -681,13 +771,15 @@ impl Editor {
 }
 
 fn main() -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(stdout);
+        Terminal::new(backend)?
+    };
 
-    let mut editor = Editor::new();
+    let mut editor = Editor::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let res = editor.run(&mut terminal);
 
     // restore terminal
@@ -695,7 +787,6 @@ fn main() -> io::Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        // FIX: Reset cursor to default shape on exit
         SetCursorStyle::DefaultUserShape
     )?;
     terminal.show_cursor()?;

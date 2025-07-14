@@ -11,3 +11,6 @@ crossterm = "0.27.0"
 
 unicode-segmentation = "1.11.0"
 unicode-width = "0.1.11"
+
+wasmtime = "21.0.1"
+crossbeam-channel = "0.5.13"
