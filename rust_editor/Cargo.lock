@@ -919,6 +919,7 @@ dependencies = [
 name = "rust_editor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crossbeam-channel",
  "crossterm",
  "ratatui",
