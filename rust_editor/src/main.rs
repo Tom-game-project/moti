@@ -2,8 +2,8 @@ use std::{
     collections::HashSet,
     io,
     path::PathBuf,
-    sync::{Arc, Mutex},
     time::Duration,
+    thread
 };
 use crossterm::{
     cursor::SetCursorStyle,
@@ -22,7 +22,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-// --- プラグインシステム用のモジュールを追加 ---
+// --- プラグインシステム用のモジュール ---
 use wasmtime::*;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 // --- ここまで ---
@@ -34,13 +34,49 @@ enum Mode {
     Command,
 }
 
-// --- プラグインがホストに要求する処理を表すenum ---
+// --- ★変更点: PluginEffectの拡張 ---
+// プラグインがホストに要求する処理を表すenum
 #[derive(Debug)]
 enum PluginEffect {
     Echo(String),
+    // バッファ操作API
+    GetBufferLineLen { // 行の長さを取得
+        line_num: usize,
+        sender: Sender<Option<usize>>,
+    },
+    GetBufferLineData { // 行のデータを取得
+        line_num: usize,
+        sender: Sender<Option<String>>,
+    },
+    SetBufferLine {
+        line_num: usize,
+        text: String,
+        sender: Sender<()>,
+    },
+    // ハイライトAPI
+    AddHighlight {
+        line: usize,
+        start: usize,
+        end: usize,
+        fg: Option<(u8, u8, u8)>,
+        bg: Option<(u8, u8, u8)>,
+        sender: Sender<()>,
+    },
+    ClearHighlights(Sender<()>),
 }
 // --- ここまで ---
 
+// --- ★追加: ハイライト情報を保持する構造体 ---
+#[derive(Clone, Debug)]
+struct Highlight {
+    line: usize,
+    start_col: usize,
+    end_col: usize,
+    style: Style,
+}
+// --- ここまで ---
+
+// --- ★変更点: Buffer構造体にhighlightsフィールドを追加 ---
 struct Buffer {
     filename: Option<PathBuf>,
     lines: Vec<String>,
@@ -48,6 +84,7 @@ struct Buffer {
     col: usize,
     top_row: usize,
     modified: bool,
+    highlights: Vec<Highlight>, // ハイライト情報を保持
 }
 
 impl Buffer {
@@ -59,11 +96,14 @@ impl Buffer {
             col: 0,
             top_row: 0,
             modified: false,
+            highlights: Vec::new(), // 初期化
         }
     }
 }
+// --- ここまで ---
 
-// --- Wasmプラグインを管理する構造体 ---
+// Wasmプラグインを管理する構造体
+#[derive(Clone)]
 struct PluginManager {
     engine: Engine,
 }
@@ -79,18 +119,15 @@ impl PluginManager {
     /// 指定されたパスからWasmプラグインを読み込み、初期化する
     fn load_plugin(&self, path: &PathBuf, effect_sender: Sender<PluginEffect>) -> Result<()> {
         let mut store = Store::new(&self.engine, ());
-        
         let mut linker = Linker::new(&self.engine);
+        const TIMEOUT: Duration = Duration::from_millis(500);
 
+        // --- ★変更点: 安全なホスト関数の実装 ---
         let effect_sender_clone = effect_sender.clone();
         linker.func_wrap(
-            "host",
-            "echo",
+            "host", "echo",
             move |mut caller: Caller<'_, ()>, ptr: i32, len: i32| {
-                let mem = match caller.get_export("memory") {
-                    Some(Extern::Memory(mem)) => mem,
-                    _ => return,
-                };
+                let mem = match caller.get_export("memory") { Some(Extern::Memory(mem)) => mem, _ => return };
                 let mut buffer = vec![0; len as usize];
                 if mem.read(&caller, ptr as usize, &mut buffer).is_ok() {
                     if let Ok(message) = String::from_utf8(buffer) {
@@ -100,6 +137,68 @@ impl PluginManager {
             },
         )?;
 
+        // 1. 行の長さを取得する関数
+        let effect_sender_clone = effect_sender.clone();
+        linker.func_wrap("host", "get_buffer_line_len", move |line_num: i32| -> i32 {
+            let (tx, rx) = unbounded();
+            if effect_sender_clone.send(PluginEffect::GetBufferLineLen { line_num: line_num as usize, sender: tx }).is_err() {
+                return -1;
+            }
+            match rx.recv_timeout(TIMEOUT) {
+                Ok(Some(len)) => len as i32,
+                _ => -1, // タイムアウト or エラー
+            }
+        })?;
+
+        // 2. 実際の行データを取得する関数
+        let effect_sender_clone = effect_sender.clone();
+        linker.func_wrap("host", "get_buffer_line_data", move |mut caller: Caller<'_, ()>, line_num: i32, ptr: i32, len: i32| -> i32 {
+            let (tx, rx) = unbounded();
+            if effect_sender_clone.send(PluginEffect::GetBufferLineData { line_num: line_num as usize, sender: tx }).is_err() {
+                return -1;
+            }
+
+            match rx.recv_timeout(TIMEOUT) {
+                Ok(Some(line_text)) => {
+                    let mem = match caller.get_export("memory") { Some(Extern::Memory(mem)) => mem, _ => return -2 };
+                    if line_text.len() as i32 > len { return -3; } // バッファ不足
+                    if mem.write(&mut caller, ptr as usize, line_text.as_bytes()).is_err() { return -4; } // 書き込み失敗
+                    line_text.len() as i32
+                },
+                _ => -1, // タイムアウト or エラー
+            }
+        })?;
+
+        let effect_sender_clone = effect_sender.clone();
+        linker.func_wrap("host", "set_buffer_line", move |mut caller: Caller<'_, ()>, line_num: i32, ptr: i32, len: i32| {
+            let mem = match caller.get_export("memory") { Some(Extern::Memory(mem)) => mem, _ => return };
+            let mut buffer = vec![0; len as usize];
+            if mem.read(&caller, ptr as usize, &mut buffer).is_ok() {
+                if let Ok(text) = String::from_utf8(buffer) {
+                    let (tx, rx) = unbounded();
+                    effect_sender_clone.send(PluginEffect::SetBufferLine { line_num: line_num as usize, text, sender: tx }).unwrap();
+                    let _ = rx.recv_timeout(TIMEOUT);
+                }
+            }
+        })?;
+
+        let effect_sender_clone = effect_sender.clone();
+        linker.func_wrap("host", "add_highlight", move |line: i32, start: i32, end: i32, fg_r: i32, fg_g: i32, fg_b: i32, bg_r: i32, bg_g: i32, bg_b: i32| {
+            let fg = if fg_r >= 0 { Some((fg_r as u8, fg_g as u8, fg_b as u8)) } else { None };
+            let bg = if bg_r >= 0 { Some((bg_r as u8, bg_g as u8, bg_b as u8)) } else { None };
+            let (tx, rx) = unbounded();
+            effect_sender_clone.send(PluginEffect::AddHighlight { line: line as usize, start: start as usize, end: end as usize, fg, bg, sender: tx }).unwrap();
+            let _ = rx.recv_timeout(TIMEOUT);
+        })?;
+
+        let effect_sender_clone = effect_sender.clone();
+        linker.func_wrap("host", "clear_highlights", move || {
+            let (tx, rx) = unbounded();
+            effect_sender_clone.send(PluginEffect::ClearHighlights(tx)).unwrap();
+            let _ = rx.recv_timeout(TIMEOUT);
+        })?;
+        // --- ここまで ---
+
         let module = Module::from_file(&self.engine, path)?;
         let instance = linker.instantiate(&mut store, &module)?;
         let init_func = instance.get_typed_func::<(), ()>(&mut store, "init")?;
@@ -108,8 +207,6 @@ impl PluginManager {
         Ok(())
     }
 }
-// --- ここまで ---
-
 
 struct TreeItem {
     path: PathBuf,
@@ -126,14 +223,9 @@ struct Editor {
     scroll_offset_col: usize,
     should_exit: bool,
     pending_command_prefix: Option<char>,
-
-    // --- プラグイン関連のフィールド ---
     plugin_manager: PluginManager,
     plugin_event_receiver: Receiver<PluginEffect>,
     plugin_event_sender: Sender<PluginEffect>,
-    // --- ここまで ---
-
-    // Directory Tree Properties
     tree_visible: bool,
     tree_view_active: bool,
     tree_width: u16,
@@ -159,7 +251,6 @@ impl Editor {
             plugin_manager: PluginManager::new()?,
             plugin_event_receiver: rx,
             plugin_event_sender: tx,
-
             tree_visible: true,
             tree_view_active: true,
             tree_width: 30,
@@ -175,35 +266,77 @@ impl Editor {
         Ok(editor)
     }
 
-    // FIX: &mut self に変更し、command_message を直接更新する
     fn load_plugins(&mut self) {
-        let plugin_path = PathBuf::from("./plugin.wasm");
-        if plugin_path.exists() {
-            if let Err(e) = self.plugin_manager.load_plugin(&plugin_path, self.plugin_event_sender.clone()) {
-                self.command_message = format!("Failed to load plugin: {}", e);
-            }
-        } else {
+                let plugin_path = PathBuf::from("./plugin.wasm");
+        if !plugin_path.exists() {
             self.command_message = "plugin.wasm not found. Skipping plugin load.".to_string();
+            return;
         }
+
+        // スレッドに渡すためのコンポーネントをクローンする
+        let plugin_manager = self.plugin_manager.clone();
+        let effect_sender = self.plugin_event_sender.clone();
+
+        // エラー報告用に、さらにクローンする
+        let error_sender = self.plugin_event_sender.clone();
+
+        // プラグインの読み込みと初期化を新しいスレッドで実行する
+        thread::spawn(move || {
+            if let Err(e) = plugin_manager.load_plugin(&plugin_path, effect_sender) {
+                // 読み込みに失敗した場合、Echoエフェクトを使ってメインスレッドにエラーを通知する
+                let error_msg = format!("Failed to load plugin: {}", e);
+                // メインスレッドが終了している可能性も考慮し、sendの結果は無視する
+                let _ = error_sender.send(PluginEffect::Echo(error_msg));
+            }
+        });
     }
     
+    // --- ★変更点: handle_plugin_eventsで新しいEffectを処理 ---
     fn handle_plugin_events(&mut self) {
         while let Ok(effect) = self.plugin_event_receiver.try_recv() {
             match effect {
-                PluginEffect::Echo(message) => {
-                    self.command_message = message;
+                PluginEffect::Echo(message) => self.command_message = message,
+                PluginEffect::GetBufferLineLen { line_num, sender } => {
+                    let len = self.active_buffer().and_then(|b| b.lines.get(line_num).map(|s| s.len()));
+                    sender.send(len).unwrap();
+                }
+                PluginEffect::GetBufferLineData { line_num, sender } => {
+                    let line = self.active_buffer().and_then(|b| b.lines.get(line_num).cloned());
+                    sender.send(line).unwrap();
+                }
+                PluginEffect::SetBufferLine { line_num, text, sender } => {
+                    if let Some(buffer) = self.active_buffer() {
+                        if line_num < buffer.lines.len() {
+                            buffer.lines[line_num] = text;
+                            buffer.modified = true;
+                        }
+                    }
+                    sender.send(()).unwrap();
+                }
+                PluginEffect::AddHighlight { line, start, end, fg, bg, sender } => {
+                    if let Some(buffer) = self.active_buffer() {
+                        let mut style = Style::default();
+                        if let Some((r, g, b)) = fg { style = style.fg(Color::Rgb(r, g, b)); }
+                        if let Some((r, g, b)) = bg { style = style.bg(Color::Rgb(r, g, b)); }
+                        buffer.highlights.push(Highlight { line, start_col: start, end_col: end, style });
+                    }
+                    sender.send(()).unwrap();
+                }
+                PluginEffect::ClearHighlights(sender) => {
+                    if let Some(buffer) = self.active_buffer() { buffer.highlights.clear(); }
+                    sender.send(()).unwrap();
                 }
             }
         }
     }
+    // --- ここまで ---
 
     fn active_buffer(&mut self) -> Option<&mut Buffer> {
         self.buffers.get_mut(self.active_buffer_index)
     }
 
-    /// The main application loop.
     fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-        self.load_plugins(); // アプリケーション起動時にプラグインを読み込む
+        self.load_plugins();
 
         loop {
             if self.should_exit {
@@ -232,7 +365,6 @@ impl Editor {
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        // FIX: ユーザーが新しいキー操作をしたら、古い通知メッセージをクリアする
                         if self.mode != Mode::Command {
                             self.command_message.clear();
                         }
@@ -253,7 +385,6 @@ impl Editor {
         }
     }
 
-    // ... (他のメソッドは変更なし) ...
     fn clamp_cursor_position(&mut self) {
         if let Some(buffer) = self.active_buffer() {
             buffer.row = buffer.row.min(buffer.lines.len().saturating_sub(1));
@@ -525,7 +656,7 @@ impl Editor {
 
     fn draw_tree_view(&self, f: &mut Frame, area: Rect) {
         let tree_block = Block::default()
-            .title("ファイル")
+            .title("Files")
             .padding(Padding::horizontal(1));
         let inner_area = tree_block.inner(area);
         let mut lines = Vec::new();
@@ -583,13 +714,58 @@ impl Editor {
             let line_num_width = buffer.lines.len().to_string().len() + 2;
             let mut buffer_content: Vec<Line> = Vec::new();
 
+            // --- ★変更点: ハイライトを考慮した描画処理 ---
             for (i, line) in buffer.lines.iter().enumerate().skip(buffer.top_row) {
                 if i >= buffer.top_row + text_buffer_area.height as usize { break; }
+            
                 let line_number_str = format!("{:>width$}", i + 1, width = line_num_width - 1);
                 let line_number_span = Span::styled(format!("{} ", line_number_str), Style::default().fg(Color::DarkGray));
-                let text_span = Span::raw(line.clone());
-                buffer_content.push(Line::from(vec![line_number_span, text_span]));
+            
+                // この行に適用されるハイライトを収集し、開始位置でソート
+                let mut line_highlights: Vec<&Highlight> = buffer.highlights.iter()
+                    .filter(|h| h.line == i)
+                    .collect();
+                line_highlights.sort_by_key(|h| h.start_col);
+            
+                let mut spans = Vec::new();
+                let mut last_col = 0;
+                let graphemes: Vec<&str> = line.graphemes(true).collect();
+            
+                for highlight in line_highlights {
+                    // ハイライトされていない部分を追加
+                    if highlight.start_col > last_col {
+                        if let Some(text_slice) = graphemes.get(last_col..highlight.start_col) {
+                            let text: String = text_slice.join("");
+                            spans.push(Span::raw(text));
+                        }
+                    }
+                    // ハイライト部分を追加
+                    let end_col = highlight.end_col.min(graphemes.len());
+                    if let Some(text_slice) = graphemes.get(highlight.start_col..end_col) {
+                        let text: String = text_slice.join("");
+                        spans.push(Span::styled(text, highlight.style));
+                    }
+                    last_col = end_col;
+                }
+                // 残りのハイライトされていない部分を追加
+                if last_col < graphemes.len() {
+                    if let Some(text_slice) = graphemes.get(last_col..) {
+                        let text: String = text_slice.join("");
+                        spans.push(Span::raw(text));
+                    }
+                }
+                
+                // 行が空の場合の処理
+                if graphemes.is_empty() {
+                    spans.push(Span::raw(""));
+                }
+            
+                // 行番号スパンと内容スパンを結合
+                let mut line_spans = vec![line_number_span];
+                line_spans.extend(spans);
+                buffer_content.push(Line::from(line_spans));
             }
+            // --- ここまで ---
 
             let paragraph = Paragraph::new(buffer_content)
                 .scroll((0, self.scroll_offset_col as u16));
