@@ -18,7 +18,7 @@ use ratatui::{
 
 use editor::Editor;
 
-pub fn run() -> io::Result<()> {
+pub async fn run() -> io::Result<()> {
     let mut terminal = {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -28,7 +28,7 @@ pub fn run() -> io::Result<()> {
     };
 
     let mut editor = Editor::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    let res = editor.run(&mut terminal);
+    let res = editor.run(&mut terminal).await;
 
     // restore terminal
     disable_raw_mode()?;

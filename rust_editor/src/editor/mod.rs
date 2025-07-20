@@ -7,7 +7,7 @@ use std::{
 };
 use crossterm::{
     cursor::SetCursorStyle,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, EventStream},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -24,6 +24,7 @@ use unicode_width::UnicodeWidthStr;
 
 use wasmtime::*;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use futures::StreamExt;
 
 use crate::buffer::{Buffer, Highlight};
 use crate::mode::Mode;
@@ -201,7 +202,7 @@ impl Editor {
         });
     }
     
-    pub fn handle_plugin_events(&mut self) {
+pub fn handle_plugin_events(&mut self) {
         while let Ok(effect) = self.plugin_event_receiver.try_recv() {
             match effect {
                 PluginEffect::Echo(message) => self.command_message = message,
@@ -243,8 +244,9 @@ impl Editor {
         self.buffers.get_mut(self.active_buffer_index)
     }
 
-    pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
         self.load_plugins();
+        let mut event_stream = EventStream::new();
 
         loop {
             if self.should_exit {
@@ -270,23 +272,21 @@ impl Editor {
                 }
             }
 
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        if self.mode != Mode::Command {
-                            self.command_message.clear();
-                        }
+            if let Some(Ok(Event::Key(key))) = event_stream.next().await {
+                if key.kind == KeyEventKind::Press {
+                    if self.mode != Mode::Command {
+                        self.command_message.clear();
+                    }
 
-                        if self.tree_view_active && self.tree_visible {
-                            self.handle_tree_view_key(key.code);
-                        } else {
-                            let new_mode = match self.mode {
-                                Mode::Normal => self.handle_normal_mode_key(key.code),
-                                Mode::Insert => self.handle_insert_mode_key(key.code),
-                                Mode::Command => self.handle_command_mode_key(key.code),
-                            };
-                            self.mode = new_mode;
-                        }
+                    if self.tree_view_active && self.tree_visible {
+                        self.handle_tree_view_key(key.code);
+                    } else {
+                        let new_mode = match self.mode {
+                            Mode::Normal => self.handle_normal_mode_key(key.code),
+                            Mode::Insert => self.handle_insert_mode_key(key.code),
+                            Mode::Command => self.handle_command_mode_key(key.code),
+                        };
+                        self.mode = new_mode;
                     }
                 }
             }
@@ -635,7 +635,8 @@ impl Editor {
                     }
                     Err(e) => message = format!("Error loading {}: {}", path.display(), e),
                 }
-            } else {
+            }
+            else {
                 message = format!("New file: {}", path.display());
             }
         }
