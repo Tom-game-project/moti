@@ -1,5 +1,4 @@
-use std::{
-    collections::HashSet,
+use std::{ collections::HashSet,
     io,
     path::PathBuf,
     time::Duration,
@@ -201,7 +200,7 @@ impl Editor {
             }
         });
     }
-    
+
 pub fn handle_plugin_events(&mut self) {
         while let Ok(effect) = self.plugin_event_receiver.try_recv() {
             match effect {

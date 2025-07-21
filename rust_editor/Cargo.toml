@@ -1,5 +1,4 @@
-[package]
-name = "rust_editor"
+[package] name = "rust_editor"
 version = "0.1.0"
 edition = "2021"
 
@@ -14,14 +13,17 @@ name = "rust_editor"
 path = "src/main.rs"
 
 [dependencies]
+anyhow="1.0"
 ratatui = "0.26.1"
 crossterm = { version = "0.27.0", features = ["event-stream"] }
 
 unicode-segmentation = "1.11.0"
 unicode-width = "0.1.11"
 
-wasmtime = "21.0.1"
+wasmtime = {version="34.0", features = ["component-model"]}
+wasmtime-wasi = "34.0"
 crossbeam-channel = "0.5.13"
 
 tokio = { version = "1.38.0", features = ["full"] }
 futures = "0.3.30"
+
