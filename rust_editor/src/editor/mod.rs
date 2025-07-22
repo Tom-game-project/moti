@@ -46,7 +46,6 @@ impl PluginManager {
     pub fn load_plugin(&self, path: &PathBuf, effect_sender: Sender<PluginEffect>) -> Result<()> {
         let mut store = Store::new(&self.engine, ());
         let mut linker = Linker::new(&self.engine);
-        const TIMEOUT: Duration = Duration::from_millis(500);
 
         let effect_sender_clone = effect_sender.clone();
         linker.func_wrap(
@@ -62,65 +61,6 @@ impl PluginManager {
             },
         )?;
 
-        let effect_sender_clone = effect_sender.clone();
-        linker.func_wrap("host", "get_buffer_line_len", move |line_num: i32| -> i32 {
-            let (tx, rx) = unbounded();
-            if effect_sender_clone.send(PluginEffect::GetBufferLineLen { line_num: line_num as usize, sender: tx }).is_err() {
-                return -1;
-            }
-            match rx.recv_timeout(TIMEOUT) {
-                Ok(Some(len)) => len as i32,
-                _ => -1,
-            }
-        })?;
-
-        let effect_sender_clone = effect_sender.clone();
-        linker.func_wrap("host", "get_buffer_line_data", move |mut caller: Caller<'_, ()>, line_num: i32, ptr: i32, len: i32| -> i32 {
-            let (tx, rx) = unbounded();
-            if effect_sender_clone.send(PluginEffect::GetBufferLineData { line_num: line_num as usize, sender: tx }).is_err() {
-                return -1;
-            }
-
-            match rx.recv_timeout(TIMEOUT) {
-                Ok(Some(line_text)) => {
-                    let mem = match caller.get_export("memory") { Some(Extern::Memory(mem)) => mem, _ => return -2 };
-                    if line_text.len() as i32 > len { return -3; }
-                    if mem.write(&mut caller, ptr as usize, line_text.as_bytes()).is_err() { return -4; }
-                    line_text.len() as i32
-                },
-                _ => -1,
-            }
-        })?;
-
-        let effect_sender_clone = effect_sender.clone();
-        linker.func_wrap("host", "set_buffer_line", move |mut caller: Caller<'_, ()>, line_num: i32, ptr: i32, len: i32| {
-            let mem = match caller.get_export("memory") { Some(Extern::Memory(mem)) => mem, _ => return };
-            let mut buffer = vec![0; len as usize];
-            if mem.read(&caller, ptr as usize, &mut buffer).is_ok() {
-                if let Ok(text) = String::from_utf8(buffer) {
-                    let (tx, rx) = unbounded();
-                    effect_sender_clone.send(PluginEffect::SetBufferLine { line_num: line_num as usize, text, sender: tx }).unwrap();
-                    let _ = rx.recv_timeout(TIMEOUT);
-                }
-            }
-        })?;
-
-        let effect_sender_clone = effect_sender.clone();
-        linker.func_wrap("host", "add_highlight", move |line: i32, start: i32, end: i32, fg_r: i32, fg_g: i32, fg_b: i32, bg_r: i32, bg_g: i32, bg_b: i32| {
-            let fg = if fg_r >= 0 { Some((fg_r as u8, fg_g as u8, fg_b as u8)) } else { None };
-            let bg = if bg_r >= 0 { Some((bg_r as u8, bg_g as u8, bg_b as u8)) } else { None };
-            let (tx, rx) = unbounded();
-            effect_sender_clone.send(PluginEffect::AddHighlight { line: line as usize, start: start as usize, end: end as usize, fg, bg, sender: tx }).unwrap();
-            let _ = rx.recv_timeout(TIMEOUT);
-        })?;
-
-        let effect_sender_clone = effect_sender.clone();
-        linker.func_wrap("host", "clear_highlights", move || {
-            let (tx, rx) = unbounded();
-            effect_sender_clone.send(PluginEffect::ClearHighlights(tx)).unwrap();
-            let _ = rx.recv_timeout(TIMEOUT);
-        })?;
-
         let module = Module::from_file(&self.engine, path)?;
         let instance = linker.instantiate(&mut store, &module)?;
         let init_func = instance.get_typed_func::<(), ()>(&mut store, "init")?;
@@ -130,6 +70,7 @@ impl PluginManager {
     }
 }
 
+use crate::ui::style::UiStyle;
 pub struct Editor {
     pub buffers: Vec<Buffer>,
     pub active_buffer_index: usize,
@@ -150,6 +91,7 @@ pub struct Editor {
     pub selected_item_index: usize,
     pub expanded_dirs: HashSet<PathBuf>,
     pub tree_items: Vec<TreeItem>,
+    pub style: UiStyle,
 }
 
 impl Editor {
@@ -175,6 +117,7 @@ impl Editor {
             selected_item_index: 0,
             expanded_dirs: HashSet::new(),
             tree_items: Vec::new(),
+            style: UiStyle::new(),
         };
         editor.expanded_dirs.insert(editor.current_path.clone());
         editor.open_file_in_new_buffer(None);
@@ -205,36 +148,6 @@ pub fn handle_plugin_events(&mut self) {
         while let Ok(effect) = self.plugin_event_receiver.try_recv() {
             match effect {
                 PluginEffect::Echo(message) => self.command_message = message,
-                PluginEffect::GetBufferLineLen { line_num, sender } => {
-                    let len = self.active_buffer().and_then(|b| b.lines.get(line_num).map(|s| s.len()));
-                    sender.send(len).unwrap();
-                }
-                PluginEffect::GetBufferLineData { line_num, sender } => {
-                    let line = self.active_buffer().and_then(|b| b.lines.get(line_num).cloned());
-                    sender.send(line).unwrap();
-                }
-                PluginEffect::SetBufferLine { line_num, text, sender } => {
-                    if let Some(buffer) = self.active_buffer() {
-                        if line_num < buffer.lines.len() {
-                            buffer.lines[line_num] = text;
-                            buffer.modified = true;
-                        }
-                    }
-                    sender.send(()).unwrap();
-                }
-                PluginEffect::AddHighlight { line, start, end, fg, bg, sender } => {
-                    if let Some(buffer) = self.active_buffer() {
-                        let mut style = Style::default();
-                        if let Some((r, g, b)) = fg { style = style.fg(Color::Rgb(r, g, b)); }
-                        if let Some((r, g, b)) = bg { style = style.bg(Color::Rgb(r, g, b)); }
-                        buffer.highlights.push(Highlight { line, start_col: start, end_col: end, style });
-                    }
-                    sender.send(()).unwrap();
-                }
-                PluginEffect::ClearHighlights(sender) => {
-                    if let Some(buffer) = self.active_buffer() { buffer.highlights.clear(); }
-                    sender.send(()).unwrap();
-                }
             }
         }
     }

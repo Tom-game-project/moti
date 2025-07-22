@@ -1,3 +1,4 @@
+pub mod style;
 use crate::editor::Editor;
 use ratatui::{
     layout::{Rect, Constraint, Direction, Layout},
@@ -22,7 +23,7 @@ impl Editor {
             let display_text = format!("{}{}{}", item.prefix, indicator, item.path.file_name().unwrap_or_default().to_string_lossy());
             let mut line = Line::from(display_text);
             if i == self.selected_item_index {
-                line = line.style(Style::default().bg(Color::DarkGray));
+                line = line.style(self.style.tree_selected);
             }
             lines.push(line);
         }
@@ -73,7 +74,7 @@ impl Editor {
                 if i >= buffer.top_row + text_buffer_area.height as usize { break; }
 
                 let line_number_str = format!("{:>width$}", i + 1, width = line_num_width - 1);
-                let line_number_span = Span::styled(format!("{} ", line_number_str), Style::default().fg(Color::DarkGray));
+                let line_number_span = Span::styled(format!("{} ", line_number_str), self.style.line_number);
 
                 let mut line_highlights: Vec<&crate::buffer::Highlight> = buffer.highlights.iter()
                     .filter(|h| h.line == i)
@@ -133,7 +134,7 @@ impl Editor {
             Span::raw(&status_left),
             Span::raw(" ".repeat(status_area.width.saturating_sub(status_left.len() as u16 + status_right.len() as u16) as usize)),
             Span::raw(&status_right),
-        ])).style(Style::default().fg(Color::White).bg(Color::DarkGray));
+        ])).style(Style::default().fg(self.style.status_bar_foreground).bg(self.style.status_bar_background));
         f.render_widget(status_bar, Rect::new(status_area.x, status_area.y, status_area.width, 1));
 
         let command_line_text = if self.mode == crate::mode::Mode::Command {
