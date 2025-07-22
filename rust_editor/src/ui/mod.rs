@@ -95,7 +95,8 @@ impl Editor {
                     let end_col = highlight.end_col.min(graphemes.len());
                     if let Some(text_slice) = graphemes.get(highlight.start_col..end_col) {
                         let text: String = text_slice.join("");
-                        spans.push(Span::styled(text, highlight.style));
+                        let style = self.style.get_highlight_style(highlight.highlight_type);
+                        spans.push(Span::styled(text, style));
                     }
                     last_col = end_col;
                 }

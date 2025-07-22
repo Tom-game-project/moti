@@ -1,4 +1,4 @@
-use ratatui::style::Style;
+use crate::ui::style::HighlightType;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -6,7 +6,7 @@ pub struct Highlight {
     pub line: usize,
     pub start_col: usize,
     pub end_col: usize,
-    pub style: Style,
+    pub highlight_type: HighlightType,
 }
 
 pub struct Buffer {
